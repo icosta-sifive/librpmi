@@ -1,7 +1,7 @@
 ## librpmi - RPMI Protocol Implementation
 
 ## Introduction
-The librpmi is an implementation of [RISC-V Platform Management Interface](https://github.com/riscv-non-isa/riscv-rpmi).
+The librpmi is a C implementation of the [RISC-V Platform Management Interface](https://github.com/riscv-non-isa/riscv-rpmi).
 
 The librpmi implements RPMI shared memory transport, RPMI message protocol and
 various Service groups and Services as defined in the RPMI specification.
