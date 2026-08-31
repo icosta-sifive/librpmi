@@ -719,14 +719,38 @@ static struct rpmi_test_scenario scenario_base_default = {
 };
 
 /*
+ * Scenario config carrying the privilege level for the RPMI context.  Used by
+ * the S-mode inits; when scene->priv is NULL the inits default to M-mode.
+ *
+ * The BASE group is added internally during rpmi_context_create ->
+ * rpmi_context_add_group -> verify_privilege_level, so a context that creates
+ * successfully in S-mode also proves the group permits S-mode access.
+ */
+struct test_base_scenario_config {
+	enum rpmi_privilege_level privilege_level;
+};
+
+static struct test_base_scenario_config base_s_mode_config = {
+	.privilege_level = RPMI_PRIVILEGE_S_MODE,
+};
+
+/*
  * Test scenario for a transport without a P2A channel (p2a_req_queue_size=0).
  * GET_ATTRIBUTES must not advertise EV_NOTIFY, and ENABLE_NOTIFICATION must
  * return RPMI_ERR_NOTSUPP.
  */
 static int test_scenario_no_p2a_init(struct rpmi_test_scenario *scene)
 {
+	enum rpmi_privilege_level privilege_level = RPMI_PRIVILEGE_M_MODE;
+	struct test_base_scenario_config *config;
+
 	if (!scene || scene->shm || scene->shmem || scene->xport || scene->cntx)
 		return RPMI_ERR_ALREADY;
+
+	/* Honor an explicit privilege level from priv; default to M-mode */
+	config = scene->priv;
+	if (config)
+		privilege_level = config->privilege_level;
 
 	scene->shm = rpmi_env_zalloc(scene->shm_size);
 	if (!scene->shm)
@@ -759,7 +783,7 @@ static int test_scenario_no_p2a_init(struct rpmi_test_scenario *scene)
 
 	scene->cntx = rpmi_context_create("test_context_no_p2a", scene->xport,
 					  scene->max_num_groups,
-					  RPMI_PRIVILEGE_M_MODE,
+					  privilege_level,
 					  scene->base.plat_info_len,
 					  scene->base.plat_info);
 	if (!scene->cntx) {
@@ -832,6 +856,254 @@ static struct rpmi_test_scenario scenario_base_no_p2a_channel = {
 	},
 };
 
+/*
+ * S-mode context with no P2A channel: both flag conditions are false, so
+ * GET_ATTRIBUTES must clear F0_PRIVILEGE (S-mode) and F0_EV_NOTIFY (no P2A).
+ * This closes the GET_ATTRIBUTES flag matrix - the one combination not covered
+ * by the M-mode/no-P2A and S-mode/P2A scenarios.  ENABLE_NOTIFICATION must
+ * still return NOTSUPP with no P2A channel.
+ */
+static rpmi_uint32_t attribs_expdata_s_mode_no_p2a[] = {
+	RPMI_SUCCESS,
+	0, /* neither F0_PRIVILEGE (S-mode) nor F0_EV_NOTIFY (no P2A) */
+	0,
+	0,
+	0,
+};
+
+static struct rpmi_test_scenario scenario_base_s_mode_no_p2a_channel = {
+	.name = "Base Service Group S-mode No P2A Channel",
+	.shm_size = RPMI_SHM_SZ,
+	.slot_size = RPMI_SLOT_SIZE,
+	.max_num_groups = RPMI_SRVGRP_ID_MAX_COUNT,
+	.base.plat_info_len = PLAT_INFO_LEN,
+	.base.plat_info = PLAT_INFO,
+	.priv = &base_s_mode_config,
+
+	.init = test_scenario_no_p2a_init,
+	.cleanup = test_scenario_default_cleanup,
+
+	.num_tests = 2,
+	.tests = {
+		{
+			.name = "RPMI_BASE_SRV_GET_ATTRIBUTES (S-mode, no P2A channel)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_ATTRIBUTES,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = attribs_expdata_s_mode_no_p2a,
+				.expected_data_len = sizeof(attribs_expdata_s_mode_no_p2a),
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_ENABLE_NOTIFICATION (S-mode, no P2A channel)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_ENABLE_NOTIFICATION,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.request_data = enable_notif_reqdata_default,
+				.request_data_len = sizeof(enable_notif_reqdata_default),
+				.expected_data = enable_notif_expdata_no_p2a,
+				.expected_data_len = sizeof(enable_notif_expdata_no_p2a),
+			},
+			.init_request_data = test_init_request_data_from_attrs,
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+	},
+};
+
+static int test_base_priv_init(struct rpmi_test_scenario *scene)
+{
+	struct test_base_scenario_config *config;
+
+	if (!scene)
+		return RPMI_ERR_INVALID_PARAM;
+
+	config = scene->priv;
+	if (!config)
+		return RPMI_ERR_INVALID_PARAM;
+
+	if (scene->shm || scene->shmem || scene->xport || scene->cntx)
+		return RPMI_ERR_ALREADY;
+
+	scene->shm = rpmi_env_zalloc(scene->shm_size);
+	if (!scene->shm)
+		return RPMI_ERR_FAILED;
+
+	scene->shmem = rpmi_shmem_create("test_shmem",
+					 (unsigned long)scene->shm, scene->shm_size,
+					 &rpmi_shmem_simple_ops, NULL);
+	if (!scene->shmem) {
+		printf("%s: failed to create test rpmi_shmem\n", __func__);
+		rpmi_env_free(scene->shm);
+		scene->shm = NULL;
+		return RPMI_ERR_FAILED;
+	}
+
+	scene->xport = rpmi_transport_shmem_create("test_transport", scene->slot_size,
+						   ((scene->shm_size * 3) / 4) / 2,
+						   ((scene->shm_size * 1) / 4) / 2,
+						   scene->shmem);
+	if (!scene->xport) {
+		printf("%s: failed to create test rpmi_transport\n", __func__);
+		rpmi_shmem_destroy(scene->shmem);
+		scene->shmem = NULL;
+		rpmi_env_free(scene->shm);
+		scene->shm = NULL;
+		return RPMI_ERR_FAILED;
+	}
+
+	scene->cntx = rpmi_context_create("test_context", scene->xport,
+					  scene->max_num_groups,
+					  config->privilege_level,
+					  scene->base.plat_info_len,
+					  scene->base.plat_info);
+	if (!scene->cntx) {
+		printf("%s: failed to create test rpmi_context\n", __func__);
+		rpmi_transport_shmem_destroy(scene->xport);
+		scene->xport = NULL;
+		rpmi_shmem_destroy(scene->shmem);
+		scene->shmem = NULL;
+		rpmi_env_free(scene->shm);
+		scene->shm = NULL;
+		return RPMI_ERR_FAILED;
+	}
+
+	scene->token_sequence = 0;
+	return 0;
+}
+
+/*
+ * GET_ATTRIBUTES: in an S-mode context the F0_PRIVILEGE bit must be clear.
+ * F0_EV_NOTIFY stays set because this transport has a P2A channel.
+ */
+static rpmi_uint32_t attribs_expdata_s_mode[] = {
+	RPMI_SUCCESS,
+	RPMI_BASE_FLAGS_F0_EV_NOTIFY, /* no F0_PRIVILEGE in S-mode */
+	0,
+	0,
+	0,
+};
+
+static struct rpmi_test_scenario scenario_base_s_mode = {
+	.name = "Base Service Group (S-mode)",
+	.shm_size = RPMI_SHM_SZ,
+	.slot_size = RPMI_SLOT_SIZE,
+	.max_num_groups = RPMI_SRVGRP_ID_MAX_COUNT,
+	.base.plat_info_len = PLAT_INFO_LEN,
+	.base.plat_info = PLAT_INFO,
+	.priv = &base_s_mode_config,
+
+	.init = test_base_priv_init,
+	.cleanup = test_scenario_default_cleanup,
+
+	.num_tests = 8,
+	.tests = {
+		{
+			/*
+			 * Key S-mode test: F0_PRIVILEGE must be cleared when the
+			 * context privilege level is S-mode.
+			 */
+			.name = "RPMI_BASE_SRV_GET_ATTRIBUTES (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_ATTRIBUTES,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = attribs_expdata_s_mode,
+				.expected_data_len = sizeof(attribs_expdata_s_mode),
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_GET_IMPLEMENTATION_VERSION (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_IMPLEMENTATION_VERSION,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = impl_ver_expdata_default,
+				.expected_data_len = sizeof(impl_ver_expdata_default),
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_GET_IMPLEMENTATION_IDN (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_IMPLEMENTATION_IDN,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = impl_idn_expdata_default,
+				.expected_data_len = sizeof(impl_idn_expdata_default),
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_GET_SPEC_VERSION (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_SPEC_VERSION,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = spec_ver_expdata_default,
+				.expected_data_len = sizeof(spec_ver_expdata_default),
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_GET_PLATFORM_INFO (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_GET_PLATFORM_INFO,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.expected_data = &plat_info_val,
+				.expected_data_len = PLAT_INFO_LEN + sizeof(rpmi_uint32_t)*2,
+			},
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_PROBE_SERVICE_GROUP (S-mode)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_PROBE_SERVICE_GROUP,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.request_data = probe_reqdata_default,
+				.request_data_len = sizeof(probe_reqdata_default),
+				.expected_data = probe_expdata_default,
+				.expected_data_len = sizeof(probe_expdata_default),
+			},
+			.init_request_data = test_init_request_data_from_attrs,
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_ENABLE_NOTIFICATION (S-mode, enable)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_ENABLE_NOTIFICATION,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.request_data = enable_notif_reqdata_default,
+				.request_data_len = sizeof(enable_notif_reqdata_default),
+				.expected_data = enable_notif_expdata_default,
+				.expected_data_len = sizeof(enable_notif_expdata_default),
+			},
+			.init_request_data = test_init_request_data_from_attrs,
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+		{
+			.name = "RPMI_BASE_SRV_ENABLE_NOTIFICATION (S-mode, disable)",
+			.attrs = {
+				.servicegroup_id = RPMI_SRVGRP_BASE,
+				.service_id = RPMI_BASE_SRV_ENABLE_NOTIFICATION,
+				.flags = RPMI_MSG_NORMAL_REQUEST,
+				.request_data = disable_notif_reqdata_default,
+				.request_data_len = sizeof(disable_notif_reqdata_default),
+				.expected_data = disable_notif_expdata_default,
+				.expected_data_len = sizeof(disable_notif_expdata_default),
+			},
+			.init_request_data = test_init_request_data_from_attrs,
+			.init_expected_data = test_init_expected_data_from_attrs,
+		},
+	},
+};
+
 int main(int argc, char *argv[])
 {
 	int rc;
@@ -850,5 +1122,13 @@ int main(int argc, char *argv[])
 	if (rc)
 		return rc;
 
-	return test_scenario_execute(&scenario_base_no_p2a_channel);
+	rc = test_scenario_execute(&scenario_base_no_p2a_channel);
+	if (rc)
+		return rc;
+
+	rc = test_scenario_execute(&scenario_base_s_mode);
+	if (rc)
+		return rc;
+
+	return test_scenario_execute(&scenario_base_s_mode_no_p2a_channel);
 }
